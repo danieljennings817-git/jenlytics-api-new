@@ -2,12 +2,18 @@ import express from "express";
 import { Pool } from "pg";
 import cors from "cors";
 import bodyParser from "body-parser";
-import { parse as parseCsv } from "csv-parse/sync";   // <-- keep this ONCE
+import { parse as parseCsv } from "csv-parse/sync";   // keep once
 import "dotenv/config";
 import fs from "fs";
 import path from "path";
 
-// ---- optional map for /ingest (column-per-meter uploads by name)
+// Optional: header→meta mapping per site
+// {
+//   "LNT-GreatYarmouth": {
+//     "Great Yarmouth Boundary Elec - Meter ID (kW hr)": { "meter_id":"ELC_BOUND","type":"electric","unit":"kWh" },
+//     "Great Yarmouth Mains water - Value (m³)":         { "meter_id":"WTR_MAIN","type":"water","unit":"m3" }
+//   }
+// }
 const meterMap = fs.existsSync(path.resolve("./meters.json"))
   ? JSON.parse(fs.readFileSync(path.resolve("./meters.json"), "utf8"))
   : {};
@@ -26,52 +32,112 @@ const pool = new Pool({
 });
 
 app.get("/health", async (_req, res) => {
-  try {
-    await pool.query("select 1");
-    res.json({ ok: true });
-  } catch {
-    res.status(500).json({ ok: false, error: "db_unavailable" });
-  }
+  try { await pool.query("select 1"); res.json({ ok: true }); }
+  catch { res.status(500).json({ ok: false, error: "db_unavailable" }); }
 });
 
-/* -------------------- NARROW INGEST (rows = readings) -------------------- */
-/* expects CSV columns: site_id,meter_id,type,unit,timestamp,value */
+/* -------------------- helpers -------------------- */
+
+// Clean fallback meter_id from header
+function toMeterId(h) {
+  return String(h || "")
+    .normalize("NFKD")
+    .replace(/[^\p{L}\p{N}]+/gu, "_")
+    .replace(/^_+|_+$/g, "")
+    .toUpperCase();
+}
+
+// Parse "14-Oct-25", "15/10/2025 00:00[:ss]" or ISO
+function parseTimestampMaybe(str) {
+  if (!str) return null;
+  const s = String(str).trim();
+
+  // dd-MMM-yy[ HH:mm[:ss]]
+  let m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2,4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (m) {
+    const day = +m[1];
+    const monMap = { jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11 };
+    const month = monMap[m[2].toLowerCase()];
+    const yr = +m[3]; const year = yr < 100 ? 2000 + yr : yr;
+    const hh = +(m[4] ?? 0), mm = +(m[5] ?? 0), ss = +(m[6] ?? 0);
+    return new Date(Date.UTC(year, month, day, hh, mm, ss));
+  }
+
+  // dd/MM/yyyy[ HH:mm[:ss]]
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (m) {
+    const day = +m[1], month = +m[2]-1, yr = +m[3]; const year = yr < 100 ? 2000 + yr : yr;
+    const hh = +(m[4] ?? 0), mm = +(m[5] ?? 0), ss = +(m[6] ?? 0);
+    return new Date(Date.UTC(year, month, day, hh, mm, ss));
+  }
+
+  const d = new Date(s);
+  if (!isNaN(d)) return d;
+  return null;
+}
+
+// Coerce "165,299.9" or "1 234,56" → number
+function parseNumber(x) {
+  if (x === undefined || x === null || x === "") return null;
+  let s = String(x).trim();
+
+  // If looks like comma-decimal "1234,56" (maybe with dot thousands)
+  if (/^-?\d{1,3}(\.\d{3})*,\d+$/.test(s) || /^-?\d+,\d+$/.test(s)) {
+    s = s.replace(/\./g, "").replace(",", ".");
+  } else {
+    // Remove thousands separators (commas/spaces) like "165,299.9" or "1 234.56"
+    s = s.replace(/(?<=\d)[ ,](?=\d{3}\b)/g, "");
+  }
+  const n = Number(s);
+  return isFinite(n) ? n : null;
+}
+
+/* -------------------- narrow ingest -------------------- */
+/* CSV columns: site_id,meter_id,type,unit,timestamp,value
+   (or if meters.json matches, can accept timestamp + named columns via ?site=... as before) */
 app.post("/ingest", async (req, res) => {
   try {
-    const site_id = req.query.site || "LNT-GreatYarmouth"; // fallback if not in CSV
+    const site_id = req.query.site || "LNT-GreatYarmouth";
     const config = meterMap[site_id] || null;
 
     const text = typeof req.body === "string" ? req.body : "";
-    const parsed = parseCsv(text, { columns: true, skip_empty_lines: true });
+    // delimiter auto-detect on first line
+    const first = (text.split(/\r?\n/)[0] || "");
+    const delim = (first.split(";").length - 1) > (first.split(",").length - 1) ? ";" : ",";
+
+    const parsed = parseCsv(text, { columns: true, skip_empty_lines: true, delimiter: delim });
 
     const rows = [];
     if (parsed.length && "timestamp" in parsed[0] && !("site_id" in parsed[0]) && config) {
-      // WIDE->NARROW via meters.json (timestamp, <friendly cols>...)
+      // WIDE->NARROW via meters.json
       for (const r of parsed) {
         const ts = r.timestamp;
         for (const [col, meta] of Object.entries(config)) {
-          if (r[col] === undefined || r[col] === "") continue;
+          const v = parseNumber(r[col]);
+          if (v === null) continue;
           rows.push({
             site_code: site_id,
             meter_id: meta.meter_id,
             type: meta.type,
             unit: meta.unit,
             ts,
-            value: Number(r[col])
+            value: v
           });
         }
       }
     } else {
-      // Narrow shape already
+      // Narrow as-is (also normalise numbers)
       for (const r of parsed) {
         if (!r.timestamp) continue;
+        const v = parseNumber(r.value);
+        if (v === null) continue;
         rows.push({
           site_code: r.site_id || site_id,
           meter_id: r.meter_id,
           type: r.type,
           unit: r.unit,
           ts: r.timestamp,
-          value: Number(r.value)
+          value: v
         });
       }
     }
@@ -82,7 +148,7 @@ app.post("/ingest", async (req, res) => {
     try {
       await client.query("begin");
 
-      // Ensure sites exist
+      // sites
       const uniqueSites = [...new Set(rows.map(r => r.site_code))];
       for (const sc of uniqueSites) {
         await client.query(
@@ -92,23 +158,23 @@ app.post("/ingest", async (req, res) => {
         );
       }
 
-      // Upsert meters
-      const seenMeters = new Set();
+      // meters
+      const seen = new Set();
       for (const r of rows) {
-        const key = `${r.site_code}::${r.meter_id}`;
-        if (seenMeters.has(key)) continue;
-        seenMeters.add(key);
+        const k = `${r.site_code}::${r.meter_id}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
         await client.query(
           `insert into meters (site_code, meter_id, type, unit)
            values ($1,$2,$3,$4)
            on conflict (site_code, meter_id)
-           do update set type = excluded.type, unit = excluded.unit`,
+           do update set type=excluded.type, unit=excluded.unit`,
           [r.site_code, r.meter_id, r.type, r.unit]
         );
       }
 
-      // Insert readings
-      const ins = `insert into readings(site_code, meter_id, ts, value)
+      // readings
+      const ins = `insert into readings (site_code, meter_id, ts, value)
                    values ($1,$2,$3,$4)
                    on conflict do nothing`;
       for (const r of rows) {
@@ -118,8 +184,7 @@ app.post("/ingest", async (req, res) => {
       await client.query("commit");
       res.json({ ok: true, rows: rows.length });
     } catch (e) {
-      await client.query("rollback");
-      throw e;
+      await client.query("rollback"); throw e;
     } finally {
       client.release();
     }
@@ -129,12 +194,10 @@ app.post("/ingest", async (req, res) => {
   }
 });
 
-/* -------------------- READ APIs -------------------- */
+/* -------------------- read APIs -------------------- */
 app.get("/sites", async (_req, res) => {
   const { rows } = await pool.query(
-    `select site_code as code, site_code as name
-     from sites
-     order by site_code`
+    `select site_code as code, site_code as name from sites order by site_code`
   );
   res.json(rows);
 });
@@ -165,46 +228,15 @@ app.get("/series", async (req, res) => {
   res.json(rows);
 });
 
-/* -------------------- WIDE INGEST (timestamp + meter columns) -------------------- */
+/* -------------------- wide ingest -------------------- */
 /* CSV:
  *   timestamp,<meter1>,<meter2>,...
- *   14-Oct-25,165299.9,1683.1
+ * Supports: comma or semicolon; UK/ISO dates; thousands/comma decimals.
  * Query:
  *   ?site=LNT-GreatYarmouth
- *   &unit=kWh (default)
- *   &type=electric (default)
+ *   &unit=kWh (default if no meters.json)
+ *   &type=electric (default if no meters.json)
  */
-function toMeterId(h) {
-  return String(h || "")
-    .trim()
-    .replace(/[^\p{L}\p{N}]+/gu, "_")
-    .replace(/^_+|_+$/g, "")
-    .toUpperCase();
-}
-
-function parseTimestampMaybe(str) {
-  if (!str) return null;
-  const s = String(str).trim();
-
-  // dd-MMM-yy or dd-MMM-yyyy
-  const m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2,4})$/);
-  if (m) {
-    const day = parseInt(m[1], 10);
-    const monStr = m[2].toLowerCase();
-    const yearRaw = parseInt(m[3], 10);
-    const monMap = { jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11 };
-    const month = monMap[monStr];
-    if (month === undefined) return null;
-    const year = yearRaw < 100 ? 2000 + yearRaw : yearRaw; // 25 -> 2025
-    return new Date(Date.UTC(year, month, day));
-  }
-
-  const d = new Date(s);
-  if (!isNaN(d)) return d;
-
-  return null;
-}
-
 app.post("/ingest/wide", async (req, res) => {
   try {
     const siteCode = String(req.query.site || "").trim();
@@ -216,17 +248,30 @@ app.post("/ingest/wide", async (req, res) => {
     const text = typeof req.body === "string" ? req.body : "";
     if (!text.trim()) return res.status(400).json({ error: "empty_body" });
 
-    const rowsCsv = parseCsv(text, { columns: true, skip_empty_lines: true });
+    // delimiter auto-detect
+    const first = (text.split(/\r?\n/)[0] || "");
+    const delim = (first.split(";").length - 1) > (first.split(",").length - 1) ? ";" : ",";
+
+    const rowsCsv = parseCsv(text, { columns: true, skip_empty_lines: true, delimiter: delim });
     if (!rowsCsv.length) return res.status(400).json({ error: "empty_csv" });
 
     const headers = Object.keys(rowsCsv[0]);
     if (!headers.length || headers[0].toLowerCase() !== "timestamp") {
       return res.status(400).json({ error: "first_column_must_be_timestamp" });
     }
-    const meterHeaders = headers.slice(1);
-    if (!meterHeaders.length) return res.status(400).json({ error: "no_meter_columns" });
+    const valueHeaders = headers.slice(1);
 
-    // Ensure site & meters exist (simple schema keyed by site_code)
+    // Build header→meta mapping (prefer meters.json, else fallback)
+    const siteMap = meterMap[siteCode] || null;
+    const headerToMeta = {};
+    for (const h of valueHeaders) {
+      if (siteMap && siteMap[h]) {
+        headerToMeta[h] = siteMap[h];
+      } else {
+        headerToMeta[h] = { meter_id: toMeterId(h), type: defType, unit: defUnit };
+      }
+    }
+
     const client = await pool.connect();
     let ingested = 0;
     try {
@@ -238,15 +283,15 @@ app.post("/ingest/wide", async (req, res) => {
         [siteCode]
       );
 
-      const meterIds = meterHeaders.map(toMeterId);
-      for (let i = 0; i < meterHeaders.length; i++) {
-        const mId = meterIds[i];
+      // upsert meters
+      for (const h of valueHeaders) {
+        const meta = headerToMeta[h];
         await client.query(
           `insert into meters (site_code, meter_id, type, unit)
            values ($1,$2,$3,$4)
            on conflict (site_code, meter_id)
-           do update set type = excluded.type, unit = excluded.unit`,
-          [siteCode, mId, defType, defUnit]
+           do update set type=excluded.type, unit=excluded.unit`,
+          [siteCode, meta.meter_id, meta.type, meta.unit]
         );
       }
 
@@ -254,32 +299,33 @@ app.post("/ingest/wide", async (req, res) => {
                           values ($1,$2,$3,$4)
                           on conflict do nothing`;
 
-      for (const r of rowsCsv) {
-        const ts = parseTimestampMaybe(r[headers[0]]);
+      for (const row of rowsCsv) {
+        const ts = parseTimestampMaybe(row[headers[0]]);
         if (!ts) continue;
 
-        for (let i = 0; i < meterHeaders.length; i++) {
-          const header = meterHeaders[i];
-          const mId = meterIds[i];
-          const mv = r[header];
-          if (mv === undefined || mv === null || mv === "") continue;
+        for (const h of valueHeaders) {
+          const meta = headerToMeta[h];
+          const val = parseNumber(row[h]);
+          if (val === null) continue;
 
-          const val = Number(mv);
-          if (!isFinite(val)) continue;
-
-          await client.query(insertText, [siteCode, mId, ts.toISOString(), val]);
+          await client.query(insertText, [siteCode, meta.meter_id, ts.toISOString(), val]);
           ingested++;
         }
       }
 
       await client.query("commit");
-      client.release();
-      res.json({ ok: true, site: siteCode, meters: meterHeaders.map(toMeterId), ingested });
+      res.json({
+        ok: true,
+        site: siteCode,
+        meters: valueHeaders.map(h => headerToMeta[h].meter_id),
+        ingested
+      });
     } catch (e) {
       try { await client.query("rollback"); } catch {}
-      client.release();
       console.error("WIDE ingest error:", e);
       res.status(500).json({ error: "server_error" });
+    } finally {
+      client.release();
     }
   } catch (e) {
     console.error(e);
@@ -289,4 +335,5 @@ app.post("/ingest/wide", async (req, res) => {
 
 const port = process.env.PORT || 8081;
 app.listen(port, () => console.log("API on " + port));
+
 
