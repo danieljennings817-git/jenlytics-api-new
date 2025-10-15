@@ -1,6 +1,16 @@
 {
   "LNT-GreatYarmouth": {
-    "Boundary_Elec": { "meter_id": "ELC_BOUND", "type": "electric", "unit": "kWh" },
-    "Mains_Water":   { "meter_id": "WTR_MAIN",  "type": "water",   "unit": "m3" }
+    "GreatYarmouth_Elec": {
+      "meter_id": "ELC_BOUND",
+      "type": "electric",
+      "unit": "kWh"
+    },
+    "GreatYarmouth_Water": {
+      "meter_id": "WTR_MAIN",
+      "type": "water",
+      "unit": "m3"
+    }
   }
 }
+
+
