@@ -73,10 +73,13 @@ function makeUniqueHeaders(headers) {
   });
 }
 
-// Timestamp parser (ISO, dd/MM/yyyy, dd-MMM-yy, Excel serial)
+// Timestamp parser (ISO, UK/EU/US variants, AM/PM, Excel serial, trims trailing TZ words/offsets)
 function parseTimestampMaybe(str) {
-  if (!str) return null;
-  const s = String(str).trim();
+  if (str === undefined || str === null) return null;
+  let s = String(str).trim();
+
+  // Strip trailing timezone words/offsets we ignore for ingest
+  s = s.replace(/\s*(GMT|UTC|[+-]\d{2}:\d{2})$/i, "").trim();
 
   // Excel serial (days since 1899-12-30)
   if (/^\d{5}(\.\d+)?$/.test(s)) {
@@ -85,28 +88,51 @@ function parseTimestampMaybe(str) {
     return new Date(base.getTime() + ms);
   }
 
-  // dd-MMM-yy[ HH:mm[:ss]]
-  let m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2,4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+  // dd-MMM-yy[ HH:mm[:ss][ AM/PM]]
+  let m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2,4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s?(AM|PM))?)?$/i);
   if (m) {
     const day = +m[1];
     const monMap = { jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11 };
     const month = monMap[m[2].toLowerCase()];
     const yr = +m[3]; const year = yr < 100 ? 2000 + yr : yr;
-    const hh = +(m[4] ?? 0), mm = +(m[5] ?? 0), ss = +(m[6] ?? 0);
+    let hh = +(m[4] ?? 0), mm = +(m[5] ?? 0), ss = +(m[6] ?? 0);
+    const ap = (m[7] || "").toUpperCase();
+    if (ap) { if (ap === "PM" && hh < 12) hh += 12; if (ap === "AM" && hh === 12) hh = 0; }
     return new Date(Date.UTC(year, month, day, hh, mm, ss));
   }
 
-  // dd/MM/yyyy[ HH:mm[:ss]]
-  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+  // dd/MM/yyyy[ HH:mm[:ss][ AM/PM]]
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s?(AM|PM))?)?$/i);
   if (m) {
     const day = +m[1], month = +m[2]-1, yr = +m[3]; const year = yr < 100 ? 2000 + yr : yr;
+    let hh = +(m[4] ?? 0), mm = +(m[5] ?? 0), ss = +(m[6] ?? 0);
+    const ap = (m[7] || "").toUpperCase();
+    if (ap) { if (ap === "PM" && hh < 12) hh += 12; if (ap === "AM" && hh === 12) hh = 0; }
+    return new Date(Date.UTC(year, month, day, hh, mm, ss));
+  }
+
+  // dd-MM-yyyy[ HH:mm[:ss][ AM/PM]]
+  m = s.match(/^(\d{1,2})-(\d{1,2})-(\d{4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s?(AM|PM))?)?$/i);
+  if (m) {
+    const day = +m[1], month = +m[2]-1, year = +m[3];
+    let hh = +(m[4] ?? 0), mm = +(m[5] ?? 0), ss = +(m[6] ?? 0);
+    const ap = (m[7] || "").toUpperCase();
+    if (ap) { if (ap === "PM" && hh < 12) hh += 12; if (ap === "AM" && hh === 12) hh = 0; }
+    return new Date(Date.UTC(year, month, day, hh, mm, ss));
+  }
+
+  // ISO-ish: yyyy-MM-dd[ T]HH:mm[:ss]
+  m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (m) {
+    const year = +m[1], month = +m[2]-1, day = +m[3];
     const hh = +(m[4] ?? 0), mm = +(m[5] ?? 0), ss = +(m[6] ?? 0);
     return new Date(Date.UTC(year, month, day, hh, mm, ss));
   }
 
-  // ISO or other parsable formats
+  // Fallback: native Date
   const d = new Date(s);
   if (!isNaN(d)) return d;
+
   return null;
 }
 
@@ -363,6 +389,12 @@ app.post("/ingest/wide", async (req, res) => {
     const totalRows = rowsCsv.length;
     let scannedRows = 0;
     let badTimestamps = 0;
+    let badTimestampExamples = [];
+
+    const tsSamples = [];
+    for (let i = 0; i < Math.min(5, rowsCsv.length); i++) {
+      tsSamples.push(String(rowsCsv[i][headers[0]]));
+    }
 
     const per = {}; // per header stats
     for (const h of valueHeaders) {
@@ -398,7 +430,14 @@ app.post("/ingest/wide", async (req, res) => {
 
       for (const row of rowsCsv) {
         const ts = parseTimestampMaybe(row[headers[0]]);
-        if (!ts) { badTimestamps++; continue; }
+        if (!ts) {
+          if (badTimestampExamples.length < 3) {
+            const raw = row[headers[0]];
+            badTimestampExamples.push(raw === undefined ? "<undefined>" : String(raw));
+          }
+          badTimestamps++;
+          continue;
+        }
         scannedRows++;
 
         for (const h of valueHeaders) {
@@ -435,6 +474,8 @@ app.post("/ingest/wide", async (req, res) => {
           total_rows: totalRows,
           scanned_rows: scannedRows,
           bad_timestamps: badTimestamps,
+          bad_timestamp_examples: badTimestampExamples,
+          timestamp_samples: tsSamples,
           per_column: per
         };
       }
@@ -455,6 +496,7 @@ app.post("/ingest/wide", async (req, res) => {
 
 const port = process.env.PORT || 8081;
 app.listen(port, () => console.log("API on " + port));
+
 
 
 
