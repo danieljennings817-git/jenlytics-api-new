@@ -49,16 +49,18 @@ function toMeterId(h) {
     .toUpperCase();
 }
 
-// Normalise header text (trim, collapse spaces, remove NBSP, unify quotes)
 function normHeader(h) {
   return String(h ?? "")
-    .replace(/\uFEFF/g, "")       // BOM if present
-    .replace(/\u00A0/g, " ")      // NBSP → space
-    .replace(/[“”]/g, '"')        // smart quotes → "
-    .replace(/[’]/g, "'")         // smart apostrophe → '
+    .replace(/\uFEFF/g, "")          // BOM
+    .replace(/\u00A0/g, " ")         // NBSP → space
+    .replace(/[“”]/g, '"')           // smart quotes → "
+    .replace(/[’]/g, "'")            // smart apostrophe → '
+    .replace(/m³/gi, "m3")           // proper superscript ³
+    .replace(/m�/gi, "m3")           // garbled ³ from bad encoding
     .replace(/\s+/g, " ")
     .trim();
 }
+
 
 // Ensure headers are unique so csv-parse doesn't drop/overwrite duplicates
 function makeUniqueHeaders(headers) {
@@ -73,13 +75,13 @@ function makeUniqueHeaders(headers) {
   });
 }
 
-// Timestamp parser (ISO, UK/EU/US variants, AM/PM, Excel serial, trims trailing TZ words/offsets)
 function parseTimestampMaybe(str) {
   if (str === undefined || str === null) return null;
   let s = String(str).trim();
 
-  // Strip trailing timezone words/offsets we ignore for ingest
-  s = s.replace(/\s*(GMT|UTC|[+-]\d{2}:\d{2})$/i, "").trim();
+  // Strip trailing timezone words/offsets/acronyms (e.g. "BST", "GMT", "+01:00", "UTC")
+  // Keep AM/PM intact.
+  s = s.replace(/\s*(?:GMT|UTC|BST|CEST|CET|IST|EET|EEST|PST|PDT|EST|EDT|[A-Z]{2,4}|[+-]\d{2}:\d{2})$/i, "").trim();
 
   // Excel serial (days since 1899-12-30)
   if (/^\d{5}(\.\d+)?$/.test(s)) {
@@ -129,12 +131,11 @@ function parseTimestampMaybe(str) {
     return new Date(Date.UTC(year, month, day, hh, mm, ss));
   }
 
-  // Fallback: native Date
   const d = new Date(s);
   if (!isNaN(d)) return d;
-
   return null;
 }
+
 
 // Number parser (handles units, thousand/decimal variants, bracket negatives)
 function parseNumber(x) {
