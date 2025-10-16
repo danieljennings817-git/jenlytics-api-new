@@ -49,6 +49,7 @@ function toMeterId(h) {
     .toUpperCase();
 }
 
+// Normalise header text (trim, collapse spaces, remove NBSP, unify quotes, fix m³ garble)
 function normHeader(h) {
   return String(h ?? "")
     .replace(/\uFEFF/g, "")          // BOM
@@ -60,7 +61,6 @@ function normHeader(h) {
     .replace(/\s+/g, " ")
     .trim();
 }
-
 
 // Ensure headers are unique so csv-parse doesn't drop/overwrite duplicates
 function makeUniqueHeaders(headers) {
@@ -75,12 +75,12 @@ function makeUniqueHeaders(headers) {
   });
 }
 
+// Timestamp parser (handles BST/GMT acronyms, ISO, UK/EU/US variants, Excel serial)
 function parseTimestampMaybe(str) {
   if (str === undefined || str === null) return null;
   let s = String(str).trim();
 
   // Strip trailing timezone words/offsets/acronyms (e.g. "BST", "GMT", "+01:00", "UTC")
-  // Keep AM/PM intact.
   s = s.replace(/\s*(?:GMT|UTC|BST|CEST|CET|IST|EET|EEST|PST|PDT|EST|EDT|[A-Z]{2,4}|[+-]\d{2}:\d{2})$/i, "").trim();
 
   // Excel serial (days since 1899-12-30)
@@ -136,13 +136,13 @@ function parseTimestampMaybe(str) {
   return null;
 }
 
-
+// Number parser (handles units, thousand/decimal variants, bracket negatives, "nan")
 function parseNumber(x) {
   if (x === undefined || x === null) return null;
   let s = String(x).trim();
 
-  // Empty / placeholders → null
-  if (s === "" || /^(-|—|–|N\/A|null|nil|nan)$/i.test(s)) return null;  // <-- added nan
+  // Empty / placeholders → null  (added 'nan')
+  if (s === "" || /^(-|—|–|N\/A|null|nil|nan)$/i.test(s)) return null;
 
   // Bracketed negatives: (123.45) → -123.45
   let neg = false;
@@ -166,7 +166,6 @@ function parseNumber(x) {
   if (!isFinite(n)) return null;
   return neg ? -n : n;
 }
-
 
 // Try parsing with both delimiters and pick the "better" one (more columns)
 function parseCsvBest(text) {
@@ -200,7 +199,7 @@ function parseCsvBest(text) {
   return best;
 }
 
-/* -------------------- narrow ingest (unchanged) -------------------- */
+/* -------------------- narrow ingest -------------------- */
 app.post("/ingest", async (req, res) => {
   try {
     const site_id = req.query.site || "LNT-GreatYarmouth";
@@ -302,7 +301,7 @@ app.post("/ingest", async (req, res) => {
   }
 });
 
-/* -------------------- read APIs (unchanged) -------------------- */
+/* -------------------- read APIs -------------------- */
 app.get("/sites", async (_req, res) => {
   const { rows } = await pool.query(
     `select site_code as code, site_code as name from sites order by site_code`
@@ -497,6 +496,7 @@ app.post("/ingest/wide", async (req, res) => {
 
 const port = process.env.PORT || 8081;
 app.listen(port, () => console.log("API on " + port));
+
 
 
 
