@@ -141,7 +141,7 @@ function parseNumber(x) {
   if (x === undefined || x === null) return null;
   let s = String(x).trim();
 
-  // Empty / placeholders → null  (added 'nan')
+  // Empty / placeholders → null  (includes 'nan')
   if (s === "" || /^(-|—|–|N\/A|null|nil|nan)$/i.test(s)) return null;
 
   // Bracketed negatives: (123.45) → -123.45
@@ -335,16 +335,16 @@ app.get("/series", async (req, res) => {
   res.json(rows);
 });
 
-/* -------------------- WIDE ingest with DEBUG -------------------- */
+/* -------------------- WIDE ingest with DEBUG + forward-fill -------------------- */
 /*
  * CSV:
  *   timestamp,<meter1>,<meter2>,...
- * Supports: comma or semicolon; UK/ISO dates; thousands/comma decimals.
- * Query:
+ * Query params:
  *   ?site=LNT-GreatYarmouth
- *   &unit=kWh (default if no meters.json)
- *   &type=electric (default if no meters.json)
- *   &debug=1  (return detailed parsing diagnostics)
+ *   &unit=kWh  (default if no meters.json)
+ *   &type=electric
+ *   &debug=1   (include diagnostics)
+ *   &fill=drop|ffill|zero  (missing-value policy; default drop)
  */
 app.post("/ingest/wide", async (req, res) => {
   try {
@@ -354,6 +354,7 @@ app.post("/ingest/wide", async (req, res) => {
     const defUnit = (req.query.unit || "kWh").toString();
     const defType = (req.query.type || "electric").toString();
     const wantDebug = String(req.query.debug || "0") === "1";
+    const fill = String(req.query.fill || "drop"); // drop | ffill | zero
 
     const text = typeof req.body === "string" ? req.body : "";
     if (!text.trim()) return res.status(400).json({ error: "empty_body" });
@@ -385,6 +386,9 @@ app.post("/ingest/wide", async (req, res) => {
       headerToMeta[h] = meta;
     }
 
+    // Forward-fill support: remember last values per header
+    const lastVals = Object.fromEntries(valueHeaders.map(h => [h, null]));
+
     // --- DEBUG counters
     const totalRows = rowsCsv.length;
     let scannedRows = 0;
@@ -396,7 +400,7 @@ app.post("/ingest/wide", async (req, res) => {
       tsSamples.push(String(rowsCsv[i][headers[0]]));
     }
 
-    const per = {}; // per header stats
+    const per = {};
     for (const h of valueHeaders) {
       per[h] = { parsed: 0, nulls: 0, bad_examples: [] };
     }
@@ -443,15 +447,27 @@ app.post("/ingest/wide", async (req, res) => {
         for (const h of valueHeaders) {
           const meta = headerToMeta[h];
           const raw = row[h];
-          const val = parseNumber(raw);
+          let val = parseNumber(raw);
+
           if (val === null) {
-            per[h].nulls++;
-            if (per[h].bad_examples.length < 3 && raw !== undefined && raw !== null && String(raw).trim() !== "") {
-              per[h].bad_examples.push(String(raw));
+            if (fill === "ffill" && lastVals[h] !== null) {
+              val = lastVals[h];
+              per[h].parsed++; // counted as filled
+            } else if (fill === "zero") {
+              val = 0;
+              per[h].parsed++; // counted as filled
+            } else {
+              per[h].nulls++;
+              if (per[h].bad_examples.length < 3 && raw !== undefined && raw !== null && String(raw).trim() !== "") {
+                per[h].bad_examples.push(String(raw));
+              }
+              continue;
             }
-            continue;
+          } else {
+            per[h].parsed++; // counted as parsed normally
           }
-          per[h].parsed++;
+
+          lastVals[h] = val; // update last seen (even for filled)
           await client.query(insertText, [siteCode, meta.meter_id, ts.toISOString(), val]);
           ingested++;
         }
@@ -476,7 +492,8 @@ app.post("/ingest/wide", async (req, res) => {
           bad_timestamps: badTimestamps,
           bad_timestamp_examples: badTimestampExamples,
           timestamp_samples: tsSamples,
-          per_column: per
+          per_column: per,
+          fill_policy: fill
         };
       }
 
@@ -496,6 +513,7 @@ app.post("/ingest/wide", async (req, res) => {
 
 const port = process.env.PORT || 8081;
 app.listen(port, () => console.log("API on " + port));
+
 
 
 
