@@ -7,7 +7,8 @@ import "dotenv/config";
 import fs from "fs";
 import path from "path";
 
-// Optional: header→meta mapping per site
+/* -------------------- meters.json (optional) -------------------- */
+// Example structure:
 // {
 //   "LNT-GreatYarmouth": {
 //     "Great Yarmouth Boundary Elec - Meter ID (kW hr)": { "meter_id":"ELC_BOUND","type":"electric","unit":"kWh" },
@@ -18,6 +19,7 @@ const meterMap = fs.existsSync(path.resolve("./meters.json"))
   ? JSON.parse(fs.readFileSync(path.resolve("./meters.json"), "utf8"))
   : {};
 
+/* -------------------- app & db -------------------- */
 const app = express();
 app.use(cors({ origin: "*" }));
 app.use(bodyParser.text({
@@ -45,6 +47,30 @@ function toMeterId(h) {
     .replace(/[^\p{L}\p{N}]+/gu, "_")
     .replace(/^_+|_+$/g, "")
     .toUpperCase();
+}
+
+// Normalise header text (trim, collapse spaces, remove NBSP, unify quotes)
+function normHeader(h) {
+  return String(h ?? "")
+    .replace(/\uFEFF/g, "")       // BOM if present
+    .replace(/\u00A0/g, " ")      // NBSP → space
+    .replace(/[“”]/g, '"')        // smart quotes → "
+    .replace(/[’]/g, "'")         // smart apostrophe → '
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Ensure headers are unique so csv-parse doesn't drop/overwrite duplicates
+function makeUniqueHeaders(headers) {
+  const seen = new Map();
+  return headers.map((h, idx) => {
+    const base = h || `col_${idx}`;
+    let name = base;
+    const n = seen.get(base) ?? 0;
+    if (n > 0) name = `${base}__${n + 1}`;
+    seen.set(base, n + 1);
+    return name;
+  });
 }
 
 // Parse "14-Oct-25", "15/10/2025 00:00[:ss]" or ISO
@@ -92,6 +118,38 @@ function parseNumber(x) {
   return isFinite(n) ? n : null;
 }
 
+// Try parsing with both delimiters and pick the "better" one (more columns)
+function parseCsvBest(text) {
+  const tryDelims = [",", ";"];
+  let best = null;
+
+  for (const delim of tryDelims) {
+    const rowsRaw = parseCsv(text, {
+      columns: (header) => {
+        const cleaned = header.map(normHeader);
+        const unique = makeUniqueHeaders(cleaned);
+        return unique;
+      },
+      bom: true,
+      skip_empty_lines: true,
+      relax_column_count: true,
+      delimiter: delim,
+      trim: false
+    });
+
+    if (!rowsRaw.length) continue;
+    const headers = Object.keys(rowsRaw[0]);
+    const score = headers.length;
+
+    if (!best || score > best.headers.length) {
+      best = { rows: rowsRaw, delimiter: delim, headers };
+    }
+  }
+
+  if (!best) return { rows: [], delimiter: ",", headers: [] };
+  return best;
+}
+
 /* -------------------- narrow ingest -------------------- */
 /* CSV columns: site_id,meter_id,type,unit,timestamp,value
    (or if meters.json matches, can accept timestamp + named columns via ?site=... as before) */
@@ -101,18 +159,24 @@ app.post("/ingest", async (req, res) => {
     const config = meterMap[site_id] || null;
 
     const text = typeof req.body === "string" ? req.body : "";
-    // delimiter auto-detect on first line
-    const first = (text.split(/\r?\n/)[0] || "");
-    const delim = (first.split(";").length - 1) > (first.split(",").length - 1) ? ";" : ",";
-
-    const parsed = parseCsv(text, { columns: true, skip_empty_lines: true, delimiter: delim });
+    const parsedBest = parseCsvBest(text);
+    const parsed = parsedBest.rows;
 
     const rows = [];
+
     if (parsed.length && "timestamp" in parsed[0] && !("site_id" in parsed[0]) && config) {
-      // WIDE->NARROW via meters.json
+      // Build a normalised lookup for meters.json keys
+      const normConfig = {};
+      Object.keys(config).forEach(k => { normConfig[normHeader(k)] = config[k]; });
+
       for (const r of parsed) {
         const ts = r.timestamp;
-        for (const [col, meta] of Object.entries(config)) {
+        const keys = Object.keys(r).filter(k => k !== "timestamp");
+        for (const col of keys) {
+          const rawMeta = config[col];
+          const meta = rawMeta ?? normConfig[normHeader(col)];
+          if (!meta) continue;
+
           const v = parseNumber(r[col]);
           if (v === null) continue;
           rows.push({
@@ -178,7 +242,8 @@ app.post("/ingest", async (req, res) => {
                    values ($1,$2,$3,$4)
                    on conflict do nothing`;
       for (const r of rows) {
-        await client.query(ins, [r.site_code, r.meter_id, r.ts, r.value]);
+        const ts = r.ts instanceof Date ? r.ts.toISOString() : r.ts;
+        await client.query(ins, [r.site_code, r.meter_id, ts, r.value]);
       }
 
       await client.query("commit");
@@ -248,28 +313,30 @@ app.post("/ingest/wide", async (req, res) => {
     const text = typeof req.body === "string" ? req.body : "";
     if (!text.trim()) return res.status(400).json({ error: "empty_body" });
 
-    // delimiter auto-detect
-    const first = (text.split(/\r?\n/)[0] || "");
-    const delim = (first.split(";").length - 1) > (first.split(",").length - 1) ? ";" : ",";
+    const parsedBest = parseCsvBest(text);
+    const rowsCsv = parsedBest.rows;
+    const headers = parsedBest.headers;
 
-    const rowsCsv = parseCsv(text, { columns: true, skip_empty_lines: true, delimiter: delim });
     if (!rowsCsv.length) return res.status(400).json({ error: "empty_csv" });
 
-    const headers = Object.keys(rowsCsv[0]);
-    if (!headers.length || headers[0].toLowerCase() !== "timestamp") {
+    if (!headers.length || normHeader(headers[0]).toLowerCase() !== "timestamp") {
       return res.status(400).json({ error: "first_column_must_be_timestamp" });
     }
     const valueHeaders = headers.slice(1);
 
-    // Build header→meta mapping (prefer meters.json, else fallback)
+    // Build header→meta mapping (prefer meters.json exact, then normalised)
     const siteMap = meterMap[siteCode] || null;
+    const normSiteMap = {};
+    if (siteMap) {
+      for (const k of Object.keys(siteMap)) normSiteMap[normHeader(k)] = siteMap[k];
+    }
+
     const headerToMeta = {};
     for (const h of valueHeaders) {
-      if (siteMap && siteMap[h]) {
-        headerToMeta[h] = siteMap[h];
-      } else {
-        headerToMeta[h] = { meter_id: toMeterId(h), type: defType, unit: defUnit };
-      }
+      const exact = siteMap && siteMap[h];
+      const normal = normSiteMap[normHeader(h)];
+      const meta = exact ?? normal ?? { meter_id: toMeterId(h), type: defType, unit: defUnit };
+      headerToMeta[h] = meta;
     }
 
     const client = await pool.connect();
@@ -335,5 +402,7 @@ app.post("/ingest/wide", async (req, res) => {
 
 const port = process.env.PORT || 8081;
 app.listen(port, () => console.log("API on " + port));
+
+
 
 
