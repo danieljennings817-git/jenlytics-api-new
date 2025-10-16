@@ -137,13 +137,12 @@ function parseTimestampMaybe(str) {
 }
 
 
-// Number parser (handles units, thousand/decimal variants, bracket negatives)
 function parseNumber(x) {
   if (x === undefined || x === null) return null;
   let s = String(x).trim();
 
   // Empty / placeholders → null
-  if (s === "" || /^(-|—|–|N\/A|null|nil)$/i.test(s)) return null;
+  if (s === "" || /^(-|—|–|N\/A|null|nil|nan)$/i.test(s)) return null;  // <-- added nan
 
   // Bracketed negatives: (123.45) → -123.45
   let neg = false;
@@ -167,6 +166,7 @@ function parseNumber(x) {
   if (!isFinite(n)) return null;
   return neg ? -n : n;
 }
+
 
 // Try parsing with both delimiters and pick the "better" one (more columns)
 function parseCsvBest(text) {
