@@ -73,10 +73,17 @@ function makeUniqueHeaders(headers) {
   });
 }
 
-// Parse "14-Oct-25", "15/10/2025 00:00[:ss]" or ISO
+// Timestamp parser (ISO, dd/MM/yyyy, dd-MMM-yy, Excel serial)
 function parseTimestampMaybe(str) {
   if (!str) return null;
   const s = String(str).trim();
+
+  // Excel serial (days since 1899-12-30)
+  if (/^\d{5}(\.\d+)?$/.test(s)) {
+    const base = new Date(Date.UTC(1899, 11, 30));
+    const ms = Math.round(parseFloat(s) * 86400000);
+    return new Date(base.getTime() + ms);
+  }
 
   // dd-MMM-yy[ HH:mm[:ss]]
   let m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2,4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
@@ -97,25 +104,41 @@ function parseTimestampMaybe(str) {
     return new Date(Date.UTC(year, month, day, hh, mm, ss));
   }
 
+  // ISO or other parsable formats
   const d = new Date(s);
   if (!isNaN(d)) return d;
   return null;
 }
 
-// Coerce "165,299.9" or "1 234,56" → number
+// Number parser (handles units, thousand/decimal variants, bracket negatives)
 function parseNumber(x) {
-  if (x === undefined || x === null || x === "") return null;
+  if (x === undefined || x === null) return null;
   let s = String(x).trim();
 
-  // If looks like comma-decimal "1234,56" (maybe with dot thousands)
+  // Empty / placeholders → null
+  if (s === "" || /^(-|—|–|N\/A|null|nil)$/i.test(s)) return null;
+
+  // Bracketed negatives: (123.45) → -123.45
+  let neg = false;
+  const mNeg = s.match(/^\((.*)\)$/);
+  if (mNeg) { neg = true; s = mNeg[1].trim(); }
+
+  // Extract first number-like token (drop units like "kWh", "m³")
+  const mNum = s.match(/[-+]?[\d\s.,]+(?:\.\d+|,\d+)?/);
+  if (!mNum) return null;
+  s = mNum[0].trim();
+
+  // Detect comma-decimal style: "1.234,56" or "1234,56"
   if (/^-?\d{1,3}(\.\d{3})*,\d+$/.test(s) || /^-?\d+,\d+$/.test(s)) {
     s = s.replace(/\./g, "").replace(",", ".");
   } else {
-    // Remove thousands separators (commas/spaces) like "165,299.9" or "1 234.56"
+    // Remove thousands separators (commas/spaces)
     s = s.replace(/(?<=\d)[ ,](?=\d{3}\b)/g, "");
   }
+
   const n = Number(s);
-  return isFinite(n) ? n : null;
+  if (!isFinite(n)) return null;
+  return neg ? -n : n;
 }
 
 // Try parsing with both delimiters and pick the "better" one (more columns)
@@ -150,9 +173,7 @@ function parseCsvBest(text) {
   return best;
 }
 
-/* -------------------- narrow ingest -------------------- */
-/* CSV columns: site_id,meter_id,type,unit,timestamp,value
-   (or if meters.json matches, can accept timestamp + named columns via ?site=... as before) */
+/* -------------------- narrow ingest (unchanged) -------------------- */
 app.post("/ingest", async (req, res) => {
   try {
     const site_id = req.query.site || "LNT-GreatYarmouth";
@@ -165,7 +186,6 @@ app.post("/ingest", async (req, res) => {
     const rows = [];
 
     if (parsed.length && "timestamp" in parsed[0] && !("site_id" in parsed[0]) && config) {
-      // Build a normalised lookup for meters.json keys
       const normConfig = {};
       Object.keys(config).forEach(k => { normConfig[normHeader(k)] = config[k]; });
 
@@ -190,7 +210,6 @@ app.post("/ingest", async (req, res) => {
         }
       }
     } else {
-      // Narrow as-is (also normalise numbers)
       for (const r of parsed) {
         if (!r.timestamp) continue;
         const v = parseNumber(r.value);
@@ -212,7 +231,6 @@ app.post("/ingest", async (req, res) => {
     try {
       await client.query("begin");
 
-      // sites
       const uniqueSites = [...new Set(rows.map(r => r.site_code))];
       for (const sc of uniqueSites) {
         await client.query(
@@ -222,7 +240,6 @@ app.post("/ingest", async (req, res) => {
         );
       }
 
-      // meters
       const seen = new Set();
       for (const r of rows) {
         const k = `${r.site_code}::${r.meter_id}`;
@@ -237,7 +254,6 @@ app.post("/ingest", async (req, res) => {
         );
       }
 
-      // readings
       const ins = `insert into readings (site_code, meter_id, ts, value)
                    values ($1,$2,$3,$4)
                    on conflict do nothing`;
@@ -259,7 +275,7 @@ app.post("/ingest", async (req, res) => {
   }
 });
 
-/* -------------------- read APIs -------------------- */
+/* -------------------- read APIs (unchanged) -------------------- */
 app.get("/sites", async (_req, res) => {
   const { rows } = await pool.query(
     `select site_code as code, site_code as name from sites order by site_code`
@@ -293,14 +309,16 @@ app.get("/series", async (req, res) => {
   res.json(rows);
 });
 
-/* -------------------- wide ingest -------------------- */
-/* CSV:
+/* -------------------- WIDE ingest with DEBUG -------------------- */
+/*
+ * CSV:
  *   timestamp,<meter1>,<meter2>,...
  * Supports: comma or semicolon; UK/ISO dates; thousands/comma decimals.
  * Query:
  *   ?site=LNT-GreatYarmouth
  *   &unit=kWh (default if no meters.json)
  *   &type=electric (default if no meters.json)
+ *   &debug=1  (return detailed parsing diagnostics)
  */
 app.post("/ingest/wide", async (req, res) => {
   try {
@@ -309,18 +327,20 @@ app.post("/ingest/wide", async (req, res) => {
 
     const defUnit = (req.query.unit || "kWh").toString();
     const defType = (req.query.type || "electric").toString();
+    const wantDebug = String(req.query.debug || "0") === "1";
 
     const text = typeof req.body === "string" ? req.body : "";
     if (!text.trim()) return res.status(400).json({ error: "empty_body" });
 
     const parsedBest = parseCsvBest(text);
-    const rowsCsv = parsedBest.rows;
-    const headers = parsedBest.headers;
+    const rowsCsv   = parsedBest.rows;
+    const headers   = parsedBest.headers;
+    const delimiter = parsedBest.delimiter;
 
     if (!rowsCsv.length) return res.status(400).json({ error: "empty_csv" });
 
     if (!headers.length || normHeader(headers[0]).toLowerCase() !== "timestamp") {
-      return res.status(400).json({ error: "first_column_must_be_timestamp" });
+      return res.status(400).json({ error: "first_column_must_be_timestamp", headers, delimiter });
     }
     const valueHeaders = headers.slice(1);
 
@@ -337,6 +357,16 @@ app.post("/ingest/wide", async (req, res) => {
       const normal = normSiteMap[normHeader(h)];
       const meta = exact ?? normal ?? { meter_id: toMeterId(h), type: defType, unit: defUnit };
       headerToMeta[h] = meta;
+    }
+
+    // --- DEBUG counters
+    const totalRows = rowsCsv.length;
+    let scannedRows = 0;
+    let badTimestamps = 0;
+
+    const per = {}; // per header stats
+    for (const h of valueHeaders) {
+      per[h] = { parsed: 0, nulls: 0, bad_examples: [] };
     }
 
     const client = await pool.connect();
@@ -368,25 +398,48 @@ app.post("/ingest/wide", async (req, res) => {
 
       for (const row of rowsCsv) {
         const ts = parseTimestampMaybe(row[headers[0]]);
-        if (!ts) continue;
+        if (!ts) { badTimestamps++; continue; }
+        scannedRows++;
 
         for (const h of valueHeaders) {
           const meta = headerToMeta[h];
-          const val = parseNumber(row[h]);
-          if (val === null) continue;
-
+          const raw = row[h];
+          const val = parseNumber(raw);
+          if (val === null) {
+            per[h].nulls++;
+            if (per[h].bad_examples.length < 3 && raw !== undefined && raw !== null && String(raw).trim() !== "") {
+              per[h].bad_examples.push(String(raw));
+            }
+            continue;
+          }
+          per[h].parsed++;
           await client.query(insertText, [siteCode, meta.meter_id, ts.toISOString(), val]);
           ingested++;
         }
       }
 
       await client.query("commit");
-      res.json({
+
+      const basePayload = {
         ok: true,
         site: siteCode,
         meters: valueHeaders.map(h => headerToMeta[h].meter_id),
         ingested
-      });
+      };
+
+      if (wantDebug) {
+        basePayload.debug = {
+          delimiter,
+          headers,
+          mapped_headers: Object.fromEntries(valueHeaders.map(h => [h, headerToMeta[h].meter_id])),
+          total_rows: totalRows,
+          scanned_rows: scannedRows,
+          bad_timestamps: badTimestamps,
+          per_column: per
+        };
+      }
+
+      res.json(basePayload);
     } catch (e) {
       try { await client.query("rollback"); } catch {}
       console.error("WIDE ingest error:", e);
@@ -402,6 +455,7 @@ app.post("/ingest/wide", async (req, res) => {
 
 const port = process.env.PORT || 8081;
 app.listen(port, () => console.log("API on " + port));
+
 
 
 
