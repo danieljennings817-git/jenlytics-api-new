@@ -13,7 +13,7 @@ import crypto from "crypto";
 // {
 //   "LNT-GreatYarmouth": {
 //     "Great Yarmouth Boundary Elec - Meter ID (kW hr)": { "meter_id":"ELC_BOUND","type":"electric","unit":"kWh" },
-//     "Great Yarmouth Mains water - Value (m³)":         { "meter_id":"WTR_MAIN","type":"water","unit":"m3" }
+//     "Great Yarmouth Mains water - Value (m3)":         { "meter_id":"WTR_MAIN","type":"water","unit":"m3" }
 //   }
 // }
 const meterMap = fs.existsSync(path.resolve("./meters.json"))
@@ -50,7 +50,7 @@ function toMeterId(h) {
     .toUpperCase();
 }
 
-// Normalise header text (trim, collapse spaces, remove NBSP, unify quotes, fix m³ garble)
+// Normalise header text (trim, collapse spaces, remove NBSP, unify quotes, fix m3 garble)
 function normHeader(h) {
   return String(h ?? "")
     .replace(/\uFEFF/g, "")          // BOM
@@ -115,7 +115,7 @@ function parseTimestampMaybe(str) {
   }
 
   // dd-MM-yyyy[ HH:mm[:ss][ AM/PM]]
-  m = s.match(/^(\d{1,2})-(\d{1,2})-(\d{4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s?(AM|PM))?)?$/i);
+  m = s.match(/^(\d{1,2})-(\d{1,2})-(\d{4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s?(AM/PM))?)?$/i);
   if (m) {
     const day = +m[1], month = +m[2]-1, year = +m[3];
     let hh = +(m[4] ?? 0), mm = +(m[5] ?? 0), ss = +(m[6] ?? 0);
@@ -142,24 +142,19 @@ function parseNumber(x) {
   if (x === undefined || x === null) return null;
   let s = String(x).trim();
 
-  // Empty / placeholders → null  (includes 'nan')
   if (s === "" || /^(-|—|–|N\/A|null|nil|nan)$/i.test(s)) return null;
 
-  // Bracketed negatives: (123.45) → -123.45
   let neg = false;
   const mNeg = s.match(/^\((.*)\)$/);
   if (mNeg) { neg = true; s = mNeg[1].trim(); }
 
-  // Extract first number-like token (drop units like "kWh", "m³")
   const mNum = s.match(/[-+]?[\d\s.,]+(?:\.\d+|,\d+)?/);
   if (!mNum) return null;
   s = mNum[0].trim();
 
-  // Detect comma-decimal style: "1.234,56" or "1234,56"
   if (/^-?\d{1,3}(\.\d{3})*,\d+$/.test(s) || /^-?\d+,\d+$/.test(s)) {
     s = s.replace(/\./g, "").replace(",", ".");
   } else {
-    // Remove thousands separators (commas/spaces)
     s = s.replace(/(?<=\d)[ ,](?=\d{3}\b)/g, "");
   }
 
@@ -379,7 +374,7 @@ app.post("/ingest/wide", async (req, res) => {
       for (const k of Object.keys(siteMap)) normSiteMap[normHeader(k)] = siteMap[k];
     }
 
-    const headerToMeta: any = {};
+    const headerToMeta = {};
     for (const h of valueHeaders) {
       const exact = siteMap && siteMap[h];
       const normal = normSiteMap[normHeader(h)];
@@ -388,22 +383,22 @@ app.post("/ingest/wide", async (req, res) => {
     }
 
     // Forward-fill support: remember last values per header
-    const lastVals: any = Object.fromEntries(valueHeaders.map(h => [h, null]));
+    const lastVals = Object.fromEntries(valueHeaders.map(h => [h, null]));
 
     // --- DEBUG counters
     const totalRows = rowsCsv.length;
     let scannedRows = 0;
     let badTimestamps = 0;
-    let badTimestampExamples: string[] = [];
+    let badTimestampExamples = [];
 
-    const tsSamples: string[] = [];
+    const tsSamples = [];
     for (let i = 0; i < Math.min(5, rowsCsv.length); i++) {
       tsSamples.push(String(rowsCsv[i][headers[0]]));
     }
 
-    const per: any = {};
+    const per = {};
     for (const h of valueHeaders) {
-      per[h] = { parsed: 0, nulls: 0, bad_examples: [] as string[] };
+      per[h] = { parsed: 0, nulls: 0, bad_examples: [] };
     }
 
     const client = await pool.connect();
@@ -476,7 +471,7 @@ app.post("/ingest/wide", async (req, res) => {
 
       await client.query("commit");
 
-      const basePayload: any = {
+      const basePayload = {
         ok: true,
         site: siteCode,
         meters: valueHeaders.map(h => headerToMeta[h].meter_id),
@@ -720,7 +715,8 @@ app.post("/ingest/email", async (req, res) => {
 });
 
 const port = process.env.PORT || 8081;
-app.listen(port, () => console.log("API on " + port));
+app.listen(port, () => console.log("API on " + port"));
+
 
 
 
