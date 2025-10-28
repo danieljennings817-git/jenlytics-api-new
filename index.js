@@ -29,6 +29,20 @@ app.use(bodyParser.text({
 }));
 app.use(express.json({ limit: "5mb" }));
 
+// --- tiny request logger (shows every hit in Render logs)
+app.use((req, _res, next) => {
+  console.log(new Date().toISOString(), req.method, req.path);
+  next();
+});
+
+// --- process-level traps so crashes print reasons
+process.on("unhandledRejection", (reason) => {
+  console.error("unhandledRejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("uncaughtException:", err);
+});
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
@@ -36,7 +50,10 @@ const pool = new Pool({
 
 app.get("/health", async (_req, res) => {
   try { await pool.query("select 1"); res.json({ ok: true }); }
-  catch { res.status(500).json({ ok: false, error: "db_unavailable" }); }
+  catch (e) {
+    console.error("health error:", e);
+    res.status(500).json({ ok: false, error: "db_unavailable", detail: String(e?.message || e) });
+  }
 });
 
 /* -------------------- helpers -------------------- */
@@ -137,7 +154,7 @@ function parseTimestampMaybe(str) {
   return null;
 }
 
-// Number parser (handles units, thousand/decimal variants, bracket negatives, "nan")
+// Number parser
 function parseNumber(x) {
   if (x === undefined || x === null) return null;
   let s = String(x).trim();
@@ -287,13 +304,21 @@ app.post("/ingest", async (req, res) => {
       await client.query("commit");
       res.json({ ok: true, rows: rows.length });
     } catch (e) {
-      await client.query("rollback"); throw e;
+      try { await client.query("rollback"); } catch {}
+      console.error("INGEST error:", e);
+      const out = { error: "server_error" };
+      if (String(process.env.DEBUG_ERRORS || "") === "1") {
+        out.detail = e?.message || String(e);
+      }
+      res.status(500).json(out);
     } finally {
       client.release();
     }
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "server_error" });
+  } catch (e) {
+    console.error("INGEST outer error:", e);
+    const out = { error: "server_error" };
+    if (String(process.env.DEBUG_ERRORS || "") === "1") out.detail = e?.message || String(e);
+    res.status(500).json(out);
   }
 });
 
@@ -497,13 +522,17 @@ app.post("/ingest/wide", async (req, res) => {
     } catch (e) {
       try { await client.query("rollback"); } catch {}
       console.error("WIDE ingest error:", e);
-      res.status(500).json({ error: "server_error" });
+      const out = { error: "server_error" };
+      if (String(process.env.DEBUG_ERRORS || "") === "1") out.detail = e?.message || String(e);
+      res.status(500).json(out);
     } finally {
       client.release();
     }
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "server_error" });
+    console.error("WIDE outer error:", e);
+    const out = { error: "server_error" };
+    if (String(process.env.DEBUG_ERRORS || "") === "1") out.detail = e?.message || String(e);
+    res.status(500).json(out);
   }
 });
 
@@ -520,7 +549,10 @@ app.post("/ingest/email", async (req, res) => {
   try {
     const { token, message_id, filename, csv, from, subject } = req.body || {};
 
-    if (token !== process.env.INGEST_TOKEN) {
+    // --- robust token check (supports either env var name)
+    const provided = String(token || "").trim();
+    const expected = String(process.env.INGEST_TOKEN || process.env.SHARED_TOKEN || "").trim();
+    if (!expected || provided !== expected) {
       return res.status(401).json({ error: "unauthorized" });
     }
     if (!csv || !message_id || !filename) {
@@ -702,22 +734,44 @@ app.post("/ingest/email", async (req, res) => {
       await client.query("COMMIT");
       return res.json({ ok: true, site: siteCode, filename, ingested });
     } catch (e) {
-      await client.query("ROLLBACK");
+      try { await client.query("ROLLBACK"); } catch {}
       console.error("email ingest error:", e);
-      return res.status(500).json({ error: "server_error" });
+      const out = { error: "server_error" };
+      if (String(process.env.DEBUG_ERRORS || "") === "1") {
+        out.detail = e?.message || String(e);
+        if (e && typeof e === "object") {
+          out.pg = {
+            code: e.code, detail: e.detail, constraint: e.constraint,
+            table: e.table, column: e.column, routine: e.routine
+          };
+        }
+      }
+      return res.status(500).json(out);
     } finally {
       client.release();
     }
   } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "server_error" });
+    console.error("email ingest outer error:", e);
+    const out = { error: "server_error" };
+    if (String(process.env.DEBUG_ERRORS || "") === "1") out.detail = e?.message || String(e);
+    return res.status(500).json(out);
   }
+});
+
+// --- global error handler (last middleware)
+app.use((err, req, res, _next) => {
+  console.error("Unhandled error:", err);
+  const out = { error: "server_error" };
+  if (String(process.env.DEBUG_ERRORS || "") === "1") out.detail = err?.message || String(err);
+  res.status(500).json(out);
 });
 
 const port = process.env.PORT || 8081;
 app.listen(port, () => {
   console.log("API on " + port);
 });
+
+
 
 
 
