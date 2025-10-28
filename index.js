@@ -6,6 +6,7 @@ import { parse as parseCsv } from "csv-parse/sync";   // keep once
 import "dotenv/config";
 import fs from "fs";
 import path from "path";
+import crypto from "crypto";
 
 /* -------------------- meters.json (optional) -------------------- */
 // Example structure:
@@ -511,8 +512,185 @@ app.post("/ingest/wide", async (req, res) => {
   }
 });
 
+/**
+ * Gmail → Apps Script posts JSON here:
+ * {
+ *   token, message_id, filename, csv,
+ *   from?, sent_at?
+ * }
+ *
+ * Optional query: ?site=YourSiteCode  (recommended)
+ */
+app.post("/ingest/email", async (req, res) => {
+  try {
+    const { token, message_id, filename, csv } = req.body || {};
+    const siteCode = String(req.query.site || "").trim() || "LNT-GreatYarmouth"; // pick your default
+
+    if (token !== process.env.INGEST_TOKEN) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
+    if (!csv || !message_id || !filename) {
+      return res.status(400).json({ error: "missing fields (csv, message_id, filename)" });
+    }
+
+    const hash = crypto.createHash("sha256").update(csv).digest("hex");
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // Deduplicate by Gmail message_id + filename
+      await client.query(
+        `INSERT INTO email_ingest_log (message_id, filename, hash)
+         VALUES ($1,$2,$3)
+         ON CONFLICT (message_id, filename) DO NOTHING`,
+        [message_id, filename, hash]
+      );
+      const seen = await client.query(
+        `SELECT 1 FROM email_ingest_log WHERE message_id=$1 AND filename=$2`,
+        [message_id, filename]
+      );
+      if (seen.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.json({ ingested: 0, reason: "duplicate" });
+      }
+
+      // Parse CSV (auto-detect , or ;)
+      const parsedBest = parseCsvBest(csv);
+      const rowsCsv   = parsedBest.rows;
+      const headers   = parsedBest.headers;
+
+      if (!rowsCsv.length) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "empty_csv" });
+      }
+
+      // Ensure site exists
+      await client.query(
+        `INSERT INTO sites (site_code, name) VALUES ($1,$1)
+         ON CONFLICT DO NOTHING`,
+        [siteCode]
+      );
+
+      // Decide shape:
+      //  A) WIDE: first col == timestamp, remaining columns are meter columns (like your /ingest/wide)
+      //  B) NARROW: columns include timestamp + (meter_id|point|point name|dis|name) + (value)
+      const firstColIsTimestamp = !!headers.length && normHeader(headers[0]).toLowerCase() === "timestamp";
+      const hasNarrowFields = (() => {
+        const H = headers.map(h => normHeader(h).toLowerCase());
+        const hasTs = H.includes("timestamp");
+        const hasMeterLike = H.includes("meter_id") || H.includes("point") || H.includes("pointname") || H.includes("name") || H.includes("dis");
+        const hasValue = H.includes("value") || H.includes("reading") || H.includes("kwh") || H.includes("kw") || H.includes("flow") || H.includes("temperature");
+        return hasTs && hasMeterLike && hasValue;
+      })();
+
+      let ingested = 0;
+
+      if (firstColIsTimestamp && headers.length > 1) {
+        // ------------ WIDE ------------
+        const valueHeaders = headers.slice(1);
+
+        // Build header→meta using meters.json if present, fallback toMeterId + sensible defaults
+        const siteMap = meterMap[siteCode] || null;
+        const normSiteMap = {};
+        if (siteMap) {
+          for (const k of Object.keys(siteMap)) normSiteMap[normHeader(k)] = siteMap[k];
+        }
+        const headerToMeta = {};
+        for (const h of valueHeaders) {
+          const meta = (siteMap && siteMap[h]) || normSiteMap[normHeader(h)] || {
+            meter_id: toMeterId(h), type: "electric", unit: "kWh" // defaults
+          };
+          headerToMeta[h] = meta;
+        }
+
+        // Upsert meters
+        for (const h of valueHeaders) {
+          const m = headerToMeta[h];
+          await client.query(
+            `INSERT INTO meters (site_code, meter_id, type, unit)
+             VALUES ($1,$2,$3,$4)
+             ON CONFLICT (site_code, meter_id)
+             DO UPDATE SET type=EXCLUDED.type, unit=EXCLUDED.unit`,
+            [siteCode, m.meter_id, m.type, m.unit]
+          );
+        }
+
+        const insertReading = `INSERT INTO readings (site_code, meter_id, ts, value)
+                               VALUES ($1,$2,$3,$4)
+                               ON CONFLICT DO NOTHING`;
+
+        for (const row of rowsCsv) {
+          const ts = parseTimestampMaybe(row[headers[0]]);
+          if (!ts) continue;
+
+          for (const h of valueHeaders) {
+            const v = parseNumber(row[h]);
+            if (v === null) continue;
+            await client.query(insertReading, [siteCode, headerToMeta[h].meter_id, ts.toISOString(), v]);
+            ingested++;
+          }
+        }
+      } else if (hasNarrowFields) {
+        // ------------ NARROW ------------
+        const insertReading = `INSERT INTO readings (site_code, meter_id, ts, value)
+                               VALUES ($1,$2,$3,$4)
+                               ON CONFLICT DO NOTHING`;
+
+        for (const row of rowsCsv) {
+          const keys = Object.fromEntries(Object.entries(row).map(([k, v]) => [normHeader(k).toLowerCase(), v]));
+          const ts = parseTimestampMaybe(keys["timestamp"]);
+          const meterLike = keys["meter_id"] || keys["point"] || keys["pointname"] || keys["name"] || keys["dis"];
+          const valueLike = keys["value"] ?? keys["reading"] ?? keys["kwh"] ?? keys["kw"] ?? keys["flow"] ?? keys["temperature"];
+
+          if (!ts || !meterLike) continue;
+
+          const meterId = (() => {
+            const siteMap = meterMap[siteCode] || {};
+            const byExact = siteMap[meterLike];
+            const byNorm  = siteMap[Object.keys(siteMap).find(k => normHeader(k).toLowerCase() === normHeader(meterLike).toLowerCase()) || ""];
+            return (byExact?.meter_id || byNorm?.meter_id || toMeterId(meterLike));
+          })();
+
+          const val = parseNumber(valueLike);
+          if (val === null) continue;
+
+          // Make sure meter exists (type/unit best-effort from meters.json)
+          const meta = (meterMap[siteCode] && (meterMap[siteCode][meterLike] || meterMap[siteCode][Object.keys(meterMap[siteCode]).find(k => normHeader(k) === normHeader(meterLike)) || ""])) || { type: "unknown", unit: "" };
+          await client.query(
+            `INSERT INTO meters (site_code, meter_id, type, unit)
+             VALUES ($1,$2,$3,$4)
+             ON CONFLICT (site_code, meter_id)
+             DO UPDATE SET type=EXCLUDED.type, unit=EXCLUDED.unit`,
+            [siteCode, meterId, meta.type || "unknown", meta.unit || ""]
+          );
+
+          await client.query(insertReading, [siteCode, meterId, ts.toISOString(), val]);
+          ingested++;
+        }
+      } else {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "unrecognised_csv_shape", headers });
+      }
+
+      await client.query("COMMIT");
+      return res.json({ ok: true, site: siteCode, filename, ingested });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      console.error("email ingest error:", e);
+      return res.status(500).json({ error: "server_error" });
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
 const port = process.env.PORT || 8081;
 app.listen(port, () => console.log("API on " + port));
+
 
 
 
