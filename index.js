@@ -115,7 +115,7 @@ function parseTimestampMaybe(str) {
   }
 
   // dd-MM-yyyy[ HH:mm[:ss][ AM/PM]]
-  m = s.match(/^(\d{1,2})-(\d{1,2})-(\d{4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s?(AM/PM))?)?$/i);
+  m = s.match(/^(\d{1,2})-(\d{1,2})-(\d{4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s?(AM|PM))?)?$/i);
   if (m) {
     const day = +m[1], month = +m[2]-1, year = +m[3];
     let hh = +(m[4] ?? 0), mm = +(m[5] ?? 0), ss = +(m[6] ?? 0);
@@ -716,6 +716,7 @@ app.post("/ingest/email", async (req, res) => {
 
 const port = process.env.PORT || 8081;
 app.listen(port, () => console.log("API on " + port"));
+
 
 
 
