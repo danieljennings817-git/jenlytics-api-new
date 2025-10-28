@@ -379,7 +379,7 @@ app.post("/ingest/wide", async (req, res) => {
       for (const k of Object.keys(siteMap)) normSiteMap[normHeader(k)] = siteMap[k];
     }
 
-    const headerToMeta = {};
+    const headerToMeta: any = {};
     for (const h of valueHeaders) {
       const exact = siteMap && siteMap[h];
       const normal = normSiteMap[normHeader(h)];
@@ -388,22 +388,22 @@ app.post("/ingest/wide", async (req, res) => {
     }
 
     // Forward-fill support: remember last values per header
-    const lastVals = Object.fromEntries(valueHeaders.map(h => [h, null]));
+    const lastVals: any = Object.fromEntries(valueHeaders.map(h => [h, null]));
 
     // --- DEBUG counters
     const totalRows = rowsCsv.length;
     let scannedRows = 0;
     let badTimestamps = 0;
-    let badTimestampExamples = [];
+    let badTimestampExamples: string[] = [];
 
-    const tsSamples = [];
+    const tsSamples: string[] = [];
     for (let i = 0; i < Math.min(5, rowsCsv.length); i++) {
       tsSamples.push(String(rowsCsv[i][headers[0]]));
     }
 
-    const per = {};
+    const per: any = {};
     for (const h of valueHeaders) {
-      per[h] = { parsed: 0, nulls: 0, bad_examples: [] };
+      per[h] = { parsed: 0, nulls: 0, bad_examples: [] as string[] };
     }
 
     const client = await pool.connect();
@@ -476,7 +476,7 @@ app.post("/ingest/wide", async (req, res) => {
 
       await client.query("commit");
 
-      const basePayload = {
+      const basePayload: any = {
         ok: true,
         site: siteCode,
         meters: valueHeaders.map(h => headerToMeta[h].meter_id),
@@ -516,15 +516,14 @@ app.post("/ingest/wide", async (req, res) => {
  * Gmail → Apps Script posts JSON here:
  * {
  *   token, message_id, filename, csv,
- *   from?, sent_at?
+ *   from?, subject?, sent_at?
  * }
  *
- * Optional query: ?site=YourSiteCode  (recommended)
+ * NOTE: site is chosen by DB routing rules (ingest_rules), NOT by querystring.
  */
 app.post("/ingest/email", async (req, res) => {
   try {
-    const { token, message_id, filename, csv } = req.body || {};
-    const siteCode = String(req.query.site || "").trim() || "LNT-GreatYarmouth"; // pick your default
+    const { token, message_id, filename, csv, from, subject } = req.body || {};
 
     if (token !== process.env.INGEST_TOKEN) {
       return res.status(401).json({ error: "unauthorized" });
@@ -555,6 +554,65 @@ app.post("/ingest/email", async (req, res) => {
         return res.json({ ingested: 0, reason: "duplicate" });
       }
 
+      // ROUTING: choose site & defaults using ingest_rules
+      const ruleRes = await client.query(
+        `SELECT site_code, default_type, default_unit
+           FROM ingest_rules
+          WHERE enabled = true
+            AND ( $1 IS NULL OR from_regex IS NULL OR $1 ~* from_regex )
+            AND ( $2 IS NULL OR subject_regex IS NULL OR $2 ~* subject_regex )
+            AND ( $3 IS NULL OR filename_regex IS NULL OR $3 ~* filename_regex )
+          ORDER BY priority ASC
+          LIMIT 1`,
+        [from || null, subject || null, filename || null]
+      );
+
+      let siteCode = "UNROUTED";
+      let defType  = "unknown";
+      let defUnit  = "";
+
+      if (ruleRes.rowCount > 0) {
+        siteCode = ruleRes.rows[0].site_code;
+        defType  = ruleRes.rows[0].default_type || defType;
+        defUnit  = ruleRes.rows[0].default_unit || defUnit;
+      }
+
+      // Ensure site exists
+      await client.query(
+        `INSERT INTO sites (site_code, name) VALUES ($1,$1)
+         ON CONFLICT DO NOTHING`,
+        [siteCode]
+      );
+
+      // Load meter aliases for this site
+      const aliasRows = await client.query(
+        `SELECT alias, meter_id, type, unit
+           FROM meter_aliases
+          WHERE site_code = $1`,
+        [siteCode]
+      );
+
+      const aliasMap = new Map();
+      for (const r of aliasRows.rows) {
+        aliasMap.set(normHeader(r.alias).toLowerCase(), {
+          meter_id: r.meter_id,
+          type: r.type || defType,
+          unit: r.unit || defUnit
+        });
+      }
+
+      const metaForHeader = (h) =>
+        aliasMap.get(normHeader(h).toLowerCase()) || {
+          meter_id: toMeterId(h),
+          type: defType,
+          unit: defUnit
+        };
+
+      const resolveMeterId = (name) => {
+        const hit = aliasMap.get(normHeader(name).toLowerCase());
+        return hit ? hit.meter_id : toMeterId(name);
+      };
+
       // Parse CSV (auto-detect , or ;)
       const parsedBest = parseCsvBest(csv);
       const rowsCsv   = parsedBest.rows;
@@ -565,16 +623,7 @@ app.post("/ingest/email", async (req, res) => {
         return res.status(400).json({ error: "empty_csv" });
       }
 
-      // Ensure site exists
-      await client.query(
-        `INSERT INTO sites (site_code, name) VALUES ($1,$1)
-         ON CONFLICT DO NOTHING`,
-        [siteCode]
-      );
-
-      // Decide shape:
-      //  A) WIDE: first col == timestamp, remaining columns are meter columns (like your /ingest/wide)
-      //  B) NARROW: columns include timestamp + (meter_id|point|point name|dis|name) + (value)
+      // Decide shape
       const firstColIsTimestamp = !!headers.length && normHeader(headers[0]).toLowerCase() === "timestamp";
       const hasNarrowFields = (() => {
         const H = headers.map(h => normHeader(h).toLowerCase());
@@ -590,29 +639,15 @@ app.post("/ingest/email", async (req, res) => {
         // ------------ WIDE ------------
         const valueHeaders = headers.slice(1);
 
-        // Build header→meta using meters.json if present, fallback toMeterId + sensible defaults
-        const siteMap = meterMap[siteCode] || null;
-        const normSiteMap = {};
-        if (siteMap) {
-          for (const k of Object.keys(siteMap)) normSiteMap[normHeader(k)] = siteMap[k];
-        }
-        const headerToMeta = {};
+        // Upsert meters (using aliases/defaults)
         for (const h of valueHeaders) {
-          const meta = (siteMap && siteMap[h]) || normSiteMap[normHeader(h)] || {
-            meter_id: toMeterId(h), type: "electric", unit: "kWh" // defaults
-          };
-          headerToMeta[h] = meta;
-        }
-
-        // Upsert meters
-        for (const h of valueHeaders) {
-          const m = headerToMeta[h];
+          const meta = metaForHeader(h);
           await client.query(
             `INSERT INTO meters (site_code, meter_id, type, unit)
              VALUES ($1,$2,$3,$4)
              ON CONFLICT (site_code, meter_id)
              DO UPDATE SET type=EXCLUDED.type, unit=EXCLUDED.unit`,
-            [siteCode, m.meter_id, m.type, m.unit]
+            [siteCode, meta.meter_id, meta.type, meta.unit]
           );
         }
 
@@ -627,7 +662,8 @@ app.post("/ingest/email", async (req, res) => {
           for (const h of valueHeaders) {
             const v = parseNumber(row[h]);
             if (v === null) continue;
-            await client.query(insertReading, [siteCode, headerToMeta[h].meter_id, ts.toISOString(), v]);
+            const meta = metaForHeader(h);
+            await client.query(insertReading, [siteCode, meta.meter_id, ts.toISOString(), v]);
             ingested++;
           }
         }
@@ -644,25 +680,20 @@ app.post("/ingest/email", async (req, res) => {
           const valueLike = keys["value"] ?? keys["reading"] ?? keys["kwh"] ?? keys["kw"] ?? keys["flow"] ?? keys["temperature"];
 
           if (!ts || !meterLike) continue;
-
-          const meterId = (() => {
-            const siteMap = meterMap[siteCode] || {};
-            const byExact = siteMap[meterLike];
-            const byNorm  = siteMap[Object.keys(siteMap).find(k => normHeader(k).toLowerCase() === normHeader(meterLike).toLowerCase()) || ""];
-            return (byExact?.meter_id || byNorm?.meter_id || toMeterId(meterLike));
-          })();
-
+          const meterId = resolveMeterId(meterLike);
           const val = parseNumber(valueLike);
           if (val === null) continue;
 
-          // Make sure meter exists (type/unit best-effort from meters.json)
-          const meta = (meterMap[siteCode] && (meterMap[siteCode][meterLike] || meterMap[siteCode][Object.keys(meterMap[siteCode]).find(k => normHeader(k) === normHeader(meterLike)) || ""])) || { type: "unknown", unit: "" };
+          // Ensure meter exists
+          const aliasKey = normHeader(meterLike).toLowerCase();
+          const aliasMeta = aliasMap.get(aliasKey) || { type: defType, unit: defUnit };
+
           await client.query(
             `INSERT INTO meters (site_code, meter_id, type, unit)
              VALUES ($1,$2,$3,$4)
              ON CONFLICT (site_code, meter_id)
              DO UPDATE SET type=EXCLUDED.type, unit=EXCLUDED.unit`,
-            [siteCode, meterId, meta.type || "unknown", meta.unit || ""]
+            [siteCode, meterId, aliasMeta.type, aliasMeta.unit]
           );
 
           await client.query(insertReading, [siteCode, meterId, ts.toISOString(), val]);
@@ -690,6 +721,8 @@ app.post("/ingest/email", async (req, res) => {
 
 const port = process.env.PORT || 8081;
 app.listen(port, () => console.log("API on " + port));
+
+
 
 
 
