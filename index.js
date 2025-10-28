@@ -586,9 +586,9 @@ app.post("/ingest/email", async (req, res) => {
         `SELECT site_code, default_type, default_unit
            FROM ingest_rules
           WHERE enabled = true
-            AND ( $1 IS NULL OR from_regex IS NULL OR $1 ~* from_regex )
-            AND ( $2 IS NULL OR subject_regex IS NULL OR $2 ~* subject_regex )
-            AND ( $3 IS NULL OR filename_regex IS NULL OR $3 ~* filename_regex )
+            AND ( $1::text IS NULL OR from_regex    IS NULL OR $1::text ~* from_regex )
+            AND ( $2::text IS NULL OR subject_regex IS NULL OR $2::text ~* subject_regex )
+            AND ( $3::text IS NULL OR filename_regex IS NULL OR $3::text ~* filename_regex )
           ORDER BY priority ASC
           LIMIT 1`,
         [from || null, subject || null, filename || null]
@@ -770,6 +770,7 @@ const port = process.env.PORT || 8081;
 app.listen(port, () => {
   console.log("API on " + port);
 });
+
 
 
 
