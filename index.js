@@ -2,14 +2,14 @@ import express from "express";
 import { Pool } from "pg";
 import cors from "cors";
 import bodyParser from "body-parser";
-import { parse as parseCsv } from "csv-parse/sync";   // keep once
+import { parse as parseCsv } from "csv-parse/sync";
 import "dotenv/config";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 
 /* -------------------- meters.json (optional) -------------------- */
-// Example structure:
+// Example:
 // {
 //   "LNT-GreatYarmouth": {
 //     "Great Yarmouth Boundary Elec - Meter ID (kW hr)": { "meter_id":"ELC_BOUND","type":"electric","unit":"kWh" },
@@ -29,7 +29,7 @@ app.use(bodyParser.text({
 }));
 app.use(express.json({ limit: "5mb" }));
 
-// --- tiny request logger (shows every hit in Render logs)
+// --- tiny request logger
 app.use((req, _res, next) => {
   console.log(new Date().toISOString(), req.method, req.path);
   next();
@@ -80,6 +80,25 @@ function normHeader(h) {
     .trim();
 }
 
+// Keys used for alias/canonical matching
+function normKey(s) {
+  return normHeader(s)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+// Token-overlap similarity (Jaccard)
+function tokenSim(a, b) {
+  const A = new Set(normKey(a).split(" ").filter(Boolean));
+  const B = new Set(normKey(b).split(" ").filter(Boolean));
+  if (!A.size || !B.size) return 0;
+  let inter = 0;
+  for (const t of A) if (B.has(t)) inter++;
+  return inter / (A.size + B.size - inter);
+}
+
 // Ensure headers are unique so csv-parse doesn't drop/overwrite duplicates
 function makeUniqueHeaders(headers) {
   const seen = new Map();
@@ -93,12 +112,12 @@ function makeUniqueHeaders(headers) {
   });
 }
 
-// Timestamp parser (handles BST/GMT acronyms, ISO, UK/EU/US variants, Excel serial)
+// Timestamp parser (BST/GMT acronyms, ISO, UK/EU/US variants, Excel serial)
 function parseTimestampMaybe(str) {
   if (str === undefined || str === null) return null;
   let s = String(str).trim();
 
-  // Strip trailing timezone words/offsets/acronyms (e.g. "BST", "GMT", "+01:00", "UTC")
+  // strip trailing tz words/offsets
   s = s.replace(/\s*(?:GMT|UTC|BST|CEST|CET|IST|EET|EEST|PST|PDT|EST|EDT|[A-Z]{2,4}|[+-]\d{2}:\d{2})$/i, "").trim();
 
   // Excel serial (days since 1899-12-30)
@@ -108,7 +127,7 @@ function parseTimestampMaybe(str) {
     return new Date(base.getTime() + ms);
   }
 
-  // dd-MMM-yy[ HH:mm[:ss][ AM/PM]]
+  // dd-MMM-yy[ HH:mm[:ss] [AM/PM]]
   let m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2,4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s?(AM|PM))?)?$/i);
   if (m) {
     const day = +m[1];
@@ -121,7 +140,7 @@ function parseTimestampMaybe(str) {
     return new Date(Date.UTC(year, month, day, hh, mm, ss));
   }
 
-  // dd/MM/yyyy[ HH:mm[:ss][ AM/PM]]
+  // dd/MM/yyyy[ ...]
   m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s?(AM|PM))?)?$/i);
   if (m) {
     const day = +m[1], month = +m[2]-1, yr = +m[3]; const year = yr < 100 ? 2000 + yr : yr;
@@ -131,7 +150,7 @@ function parseTimestampMaybe(str) {
     return new Date(Date.UTC(year, month, day, hh, mm, ss));
   }
 
-  // dd-MM-yyyy[ HH:mm[:ss][ AM/PM]]
+  // dd-MM-yyyy[ ...]
   m = s.match(/^(\d{1,2})-(\d{1,2})-(\d{4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s?(AM|PM))?)?$/i);
   if (m) {
     const day = +m[1], month = +m[2]-1, year = +m[3];
@@ -357,16 +376,6 @@ app.get("/series", async (req, res) => {
 });
 
 /* -------------------- WIDE ingest with DEBUG + forward-fill -------------------- */
-/*
- * CSV:
- *   timestamp,<meter1>,<meter2>,...
- * Query params:
- *   ?site=LNT-GreatYarmouth
- *   &unit=kWh  (default if no meters.json)
- *   &type=electric
- *   &debug=1   (include diagnostics)
- *   &fill=drop|ffill|zero  (missing-value policy; default drop)
- */
 app.post("/ingest/wide", async (req, res) => {
   try {
     const siteCode = String(req.query.site || "").trim();
@@ -473,10 +482,10 @@ app.post("/ingest/wide", async (req, res) => {
           if (val === null) {
             if (fill === "ffill" && lastVals[h] !== null) {
               val = lastVals[h];
-              per[h].parsed++; // counted as filled
+              per[h].parsed++;
             } else if (fill === "zero") {
               val = 0;
-              per[h].parsed++; // counted as filled
+              per[h].parsed++;
             } else {
               per[h].nulls++;
               if (per[h].bad_examples.length < 3 && raw !== undefined && raw !== null && String(raw).trim() !== "") {
@@ -485,10 +494,10 @@ app.post("/ingest/wide", async (req, res) => {
               continue;
             }
           } else {
-            per[h].parsed++; // counted as parsed normally
+            per[h].parsed++;
           }
 
-          lastVals[h] = val; // update last seen (even for filled)
+          lastVals[h] = val;
           await client.query(insertText, [siteCode, meta.meter_id, ts.toISOString(), val]);
           ingested++;
         }
@@ -543,7 +552,7 @@ app.post("/ingest/wide", async (req, res) => {
  *   from?, subject?, sent_at?
  * }
  *
- * NOTE: site is chosen by DB routing rules (ingest_rules), NOT by querystring.
+ * Routing: rules → sticky sender fallback. Meter IDs: alias/exact/normalized/fuzzy → learn alias.
  */
 app.post("/ingest/email", async (req, res) => {
   try {
@@ -581,7 +590,7 @@ app.post("/ingest/email", async (req, res) => {
         return res.json({ ingested: 0, reason: "duplicate" });
       }
 
-      // ROUTING: choose site & defaults using ingest_rules
+      // ROUTING: rules first
       const ruleRes = await client.query(
         `SELECT site_code, default_type, default_unit
            FROM ingest_rules
@@ -604,6 +613,16 @@ app.post("/ingest/email", async (req, res) => {
         defUnit  = ruleRes.rows[0].default_unit || defUnit;
       }
 
+      // --- STICKY FALLBACK (sender → site)
+      const fromKey = String((from || "").toLowerCase());
+      if (siteCode === "UNROUTED" && fromKey) {
+        const stick = await client.query(
+          `SELECT site_code FROM sticky_sources WHERE source_key = $1`,
+          [fromKey]
+        );
+        if (stick.rowCount) siteCode = stick.rows[0].site_code;
+      }
+
       // Ensure site exists
       await client.query(
         `INSERT INTO sites (site_code, name) VALUES ($1,$1)
@@ -611,34 +630,96 @@ app.post("/ingest/email", async (req, res) => {
         [siteCode]
       );
 
-      // Load meter aliases for this site
+      // Load canonical meters for this site + aliases
+      const metersRows = await client.query(
+        `SELECT meter_id, type, unit FROM meters WHERE site_code = $1`,
+        [siteCode]
+      );
+      const canonical = metersRows.rows.map(r => ({
+        meter_id: r.meter_id,
+        type: r.type || "",
+        unit: r.unit || "",
+        key: normKey(r.meter_id)
+      }));
+
       const aliasRows = await client.query(
         `SELECT alias, meter_id, type, unit
            FROM meter_aliases
           WHERE site_code = $1`,
         [siteCode]
       );
-
       const aliasMap = new Map();
       for (const r of aliasRows.rows) {
-        aliasMap.set(normHeader(r.alias).toLowerCase(), {
+        aliasMap.set(normKey(r.alias), {
           meter_id: r.meter_id,
-          type: r.type || defType,
-          unit: r.unit || defUnit
+          type: r.type || "",
+          unit: r.unit || ""
         });
       }
 
-      const metaForHeader = (h) =>
-        aliasMap.get(normHeader(h).toLowerCase()) || {
-          meter_id: toMeterId(h),
-          type: defType,
-          unit: defUnit
-        };
+      // smart resolver + auto-learn alias (only if not UNROUTED)
+      async function resolveMeterMeta(name) {
+        const key = normKey(name);
 
-      const resolveMeterId = (name) => {
-        const hit = aliasMap.get(normHeader(name).toLowerCase());
-        return hit ? hit.meter_id : toMeterId(name);
-      };
+        // alias hit
+        const byAlias = aliasMap.get(key);
+        if (byAlias) return byAlias;
+
+        // direct meter_id exact
+        const direct = canonical.find(c => c.meter_id === name);
+        if (direct) {
+          if (siteCode !== "UNROUTED") {
+            await client.query(
+              `INSERT INTO meter_aliases (site_code, alias, meter_id, type, unit)
+               VALUES ($1,$2,$3,$4,$5)
+               ON CONFLICT (site_code, alias)
+               DO UPDATE SET meter_id=EXCLUDED.meter_id, type=EXCLUDED.type, unit=EXCLUDED.unit`,
+              [siteCode, name, direct.meter_id, direct.type, direct.unit]
+            );
+            aliasMap.set(key, { meter_id: direct.meter_id, type: direct.type, unit: direct.unit });
+          }
+          return { meter_id: direct.meter_id, type: direct.type, unit: direct.unit };
+        }
+
+        // normalized equality to meter_id
+        const normEq = canonical.find(c => c.key === key);
+        if (normEq) {
+          if (siteCode !== "UNROUTED") {
+            await client.query(
+              `INSERT INTO meter_aliases (site_code, alias, meter_id, type, unit)
+               VALUES ($1,$2,$3,$4,$5)
+               ON CONFLICT (site_code, alias)
+               DO UPDATE SET meter_id=EXCLUDED.meter_id, type=EXCLUDED.type, unit=EXCLUDED.unit`,
+              [siteCode, name, normEq.meter_id, normEq.type, normEq.unit]
+            );
+            aliasMap.set(key, { meter_id: normEq.meter_id, type: normEq.type, unit: normEq.unit });
+          }
+          return { meter_id: normEq.meter_id, type: normEq.type, unit: normEq.unit };
+        }
+
+        // fuzzy by tokens
+        let best = null, bestScore = 0;
+        for (const c of canonical) {
+          const s = tokenSim(name, c.meter_id);
+          if (s > bestScore) { best = c; bestScore = s; }
+        }
+        if (best && bestScore >= 0.6) {
+          if (siteCode !== "UNROUTED") {
+            await client.query(
+              `INSERT INTO meter_aliases (site_code, alias, meter_id, type, unit)
+               VALUES ($1,$2,$3,$4,$5)
+               ON CONFLICT (site_code, alias)
+               DO UPDATE SET meter_id=EXCLUDED.meter_id, type=EXCLUDED.type, unit=EXCLUDED.unit`,
+              [siteCode, name, best.meter_id, best.type, best.unit]
+            );
+            aliasMap.set(key, { meter_id: best.meter_id, type: best.type, unit: best.unit });
+          }
+          return { meter_id: best.meter_id, type: best.type, unit: best.unit };
+        }
+
+        // fallback to generated id with routing defaults
+        return { meter_id: toMeterId(name), type: defType, unit: defUnit };
+      }
 
       // Parse CSV (auto-detect , or ;)
       const parsedBest = parseCsvBest(csv);
@@ -666,15 +747,15 @@ app.post("/ingest/email", async (req, res) => {
         // ------------ WIDE ------------
         const valueHeaders = headers.slice(1);
 
-        // Upsert meters (using aliases/defaults)
+        // ensure meters exist (resolve + upsert)
         for (const h of valueHeaders) {
-          const meta = metaForHeader(h);
+          const meta = await resolveMeterMeta(h);
           await client.query(
             `INSERT INTO meters (site_code, meter_id, type, unit)
              VALUES ($1,$2,$3,$4)
              ON CONFLICT (site_code, meter_id)
              DO UPDATE SET type=EXCLUDED.type, unit=EXCLUDED.unit`,
-            [siteCode, meta.meter_id, meta.type, meta.unit]
+            [siteCode, meta.meter_id, meta.type || defType, meta.unit || defUnit]
           );
         }
 
@@ -689,7 +770,7 @@ app.post("/ingest/email", async (req, res) => {
           for (const h of valueHeaders) {
             const v = parseNumber(row[h]);
             if (v === null) continue;
-            const meta = metaForHeader(h);
+            const meta = await resolveMeterMeta(h);
             await client.query(insertReading, [siteCode, meta.meter_id, ts.toISOString(), v]);
             ingested++;
           }
@@ -707,28 +788,35 @@ app.post("/ingest/email", async (req, res) => {
           const valueLike = keys["value"] ?? keys["reading"] ?? keys["kwh"] ?? keys["kw"] ?? keys["flow"] ?? keys["temperature"];
 
           if (!ts || !meterLike) continue;
-          const meterId = resolveMeterId(meterLike);
+          const meterMeta = await resolveMeterMeta(meterLike);
           const val = parseNumber(valueLike);
           if (val === null) continue;
-
-          // Ensure meter exists
-          const aliasKey = normHeader(meterLike).toLowerCase();
-          const aliasMeta = aliasMap.get(aliasKey) || { type: defType, unit: defUnit };
 
           await client.query(
             `INSERT INTO meters (site_code, meter_id, type, unit)
              VALUES ($1,$2,$3,$4)
              ON CONFLICT (site_code, meter_id)
              DO UPDATE SET type=EXCLUDED.type, unit=EXCLUDED.unit`,
-            [siteCode, meterId, aliasMeta.type, aliasMeta.unit]
+            [siteCode, meterMeta.meter_id, meterMeta.type || defType, meterMeta.unit || defUnit]
           );
 
-          await client.query(insertReading, [siteCode, meterId, ts.toISOString(), val]);
+          await client.query(insertReading, [siteCode, meterMeta.meter_id, ts.toISOString(), val]);
           ingested++;
         }
       } else {
         await client.query("ROLLBACK");
         return res.status(400).json({ error: "unrecognised_csv_shape", headers });
+      }
+
+      // remember sticky sender → site for next time (avoid UNROUTED)
+      if (siteCode !== "UNROUTED" && fromKey) {
+        await client.query(
+          `INSERT INTO sticky_sources (source_key, site_code, last_seen)
+           VALUES ($1,$2,now())
+           ON CONFLICT (source_key) DO UPDATE
+             SET site_code = EXCLUDED.site_code, last_seen = now()`,
+          [fromKey, siteCode]
+        );
       }
 
       await client.query("COMMIT");
@@ -758,7 +846,7 @@ app.post("/ingest/email", async (req, res) => {
   }
 });
 
-// --- global error handler (last middleware)
+// --- global error handler
 app.use((err, req, res, _next) => {
   console.error("Unhandled error:", err);
   const out = { error: "server_error" };
@@ -770,6 +858,8 @@ const port = process.env.PORT || 8081;
 app.listen(port, () => {
   console.log("API on " + port);
 });
+
+
 
 
 
