@@ -627,15 +627,12 @@ app.post("/ingest/email", async (req, res) => {
         if (stick.rowCount) siteCode = stick.rows[0].site_code;
       }
 
-      // Ensure site exists — but NEVER create UNROUTED    <<< changed
-      if (siteCode !== "UNROUTED") {
         await client.query(
           `INSERT INTO sites (site_code, name) VALUES ($1,$1)
            ON CONFLICT DO NOTHING`,
           [siteCode]
         );
-      }
-
+      
       // Load canonical meters for this site + aliases
       const metersRows = await client.query(
         `SELECT meter_id, type, unit FROM meters WHERE site_code = $1`,
@@ -864,6 +861,7 @@ const port = process.env.PORT || 8081;
 app.listen(port, () => {
   console.log("API on " + port);
 });
+
 
 
 
