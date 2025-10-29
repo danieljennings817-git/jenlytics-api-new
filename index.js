@@ -343,8 +343,12 @@ app.post("/ingest", async (req, res) => {
 
 /* -------------------- read APIs -------------------- */
 app.get("/sites", async (_req, res) => {
+  // <<< changed: hide UNROUTED in UI
   const { rows } = await pool.query(
-    `select site_code as code, site_code as name from sites order by site_code`
+    `select site_code as code, site_code as name
+       from sites
+      where site_code <> 'UNROUTED'
+      order by site_code`
   );
   res.json(rows);
 });
@@ -381,7 +385,7 @@ app.post("/ingest/wide", async (req, res) => {
     const siteCode = String(req.query.site || "").trim();
     if (!siteCode) return res.status(400).json({ error: "site_required" });
 
-    const defUnit = (req.query.unit || "kWh").toString();
+    const defUnit = (req.query.unit || "KWh").toString();
     const defType = (req.query.type || "electric").toString();
     const wantDebug = String(req.query.debug || "0") === "1";
     const fill = String(req.query.fill || "drop"); // drop | ffill | zero
@@ -623,12 +627,14 @@ app.post("/ingest/email", async (req, res) => {
         if (stick.rowCount) siteCode = stick.rows[0].site_code;
       }
 
-      // Ensure site exists
-      await client.query(
-        `INSERT INTO sites (site_code, name) VALUES ($1,$1)
-         ON CONFLICT DO NOTHING`,
-        [siteCode]
-      );
+      // Ensure site exists — but NEVER create UNROUTED    <<< changed
+      if (siteCode !== "UNROUTED") {
+        await client.query(
+          `INSERT INTO sites (site_code, name) VALUES ($1,$1)
+           ON CONFLICT DO NOTHING`,
+          [siteCode]
+        );
+      }
 
       // Load canonical meters for this site + aliases
       const metersRows = await client.query(
@@ -719,7 +725,7 @@ app.post("/ingest/email", async (req, res) => {
 
         // fallback to generated id with routing defaults
         return { meter_id: toMeterId(name), type: defType, unit: defUnit };
-      }
+        }
 
       // Parse CSV (auto-detect , or ;)
       const parsedBest = parseCsvBest(csv);
@@ -858,6 +864,8 @@ const port = process.env.PORT || 8081;
 app.listen(port, () => {
   console.log("API on " + port);
 });
+
+
 
 
 
