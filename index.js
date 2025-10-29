@@ -857,10 +857,72 @@ app.use((err, req, res, _next) => {
   res.status(500).json(out);
 });
 
+/* -------------------- Tariffs -------------------- */
+
+// GET tariffs for a site
+app.get("/tariffs", async (req, res) => {
+  const site = String(req.query.site || "").trim();
+  if (!site) return res.status(400).json({ error: "site_required" });
+
+  const { rows } = await pool.query(
+    `SELECT elec_p_per_kwh, heat_p_per_kwh, water_p_per_m3
+       FROM tariffs WHERE site_code = $1`,
+    [site]
+  );
+
+  if (!rows.length) {
+    // seed defaults on first read
+    await pool.query(
+      `INSERT INTO tariffs (site_code) VALUES ($1)
+       ON CONFLICT DO NOTHING`,
+      [site]
+    );
+    const seeded = await pool.query(
+      `SELECT elec_p_per_kwh, heat_p_per_kwh, water_p_per_m3
+         FROM tariffs WHERE site_code=$1`,
+      [site]
+    );
+    return res.json(seeded.rows[0]);
+  }
+  res.json(rows[0]);
+});
+
+// PUT tariffs for a site
+app.put("/tariffs", async (req, res) => {
+  const site = String(req.query.site || "").trim();
+  if (!site) return res.status(400).json({ error: "site_required" });
+
+  const { elec_p_per_kwh, heat_p_per_kwh, water_p_per_m3 } = req.body || {};
+  if (
+    [elec_p_per_kwh, heat_p_per_kwh, water_p_per_m3].some(
+      (v) => v === undefined || v === null || isNaN(Number(v))
+    )
+  ) {
+    return res.status(400).json({ error: "invalid_values" });
+  }
+
+  const { rows } = await pool.query(
+    `INSERT INTO tariffs (site_code, elec_p_per_kwh, heat_p_per_kwh, water_p_per_m3, updated_at)
+     VALUES ($1,$2,$3,$4,now())
+     ON CONFLICT (site_code)
+     DO UPDATE SET
+       elec_p_per_kwh=$2,
+       heat_p_per_kwh=$3,
+       water_p_per_m3=$4,
+       updated_at=now()
+     RETURNING elec_p_per_kwh, heat_p_per_kwh, water_p_per_m3`,
+    [site, Number(elec_p_per_kwh), Number(heat_p_per_kwh), Number(water_p_per_m3)]
+  );
+
+  res.json(rows[0]);
+});
+
+
 const port = process.env.PORT || 8081;
 app.listen(port, () => {
   console.log("API on " + port);
 });
+
 
 
 
